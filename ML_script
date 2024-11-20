@@ -1,0 +1,234 @@
+# Load required packages
+library(mlr3)
+library(mlr3learners)
+library(mlr3tuning)
+library(paradox)
+library(mlr3viz)
+library(phyloseq)
+library(ggplot2)
+library(iml) # for permutation importance
+
+# Convert phyloseq object to data frame for ML
+ps_df <- data.frame(
+  t(otu_table(ps)),
+  sal_detection = sample_data(ps)$sal_detection
+)
+
+# Create ML task
+task <- TaskClassif$new(
+  id = "microbiome",
+  backend = ps_df,
+  target = "sal_detection"
+)
+
+# Define learners with their respective parameter spaces
+learners <- list(
+  # Random Forest
+  rf = lrn("classif.ranger",
+    predict_type = "prob",
+    importance = "permutation"
+  ),
+  
+  # XGBoost
+  xgb = lrn("classif.xgboost",
+    predict_type = "prob",
+    importance = TRUE
+  ),
+  
+  # Support Vector Machine
+  svm = lrn("classif.svm",
+    predict_type = "prob",
+    type = "C-classification"
+  ),
+  
+  # Neural Network
+  nnet = lrn("classif.nnet",
+    predict_type = "prob"
+  ),
+  
+  # Elastic Net
+  glmnet = lrn("classif.glmnet",
+    predict_type = "prob"
+  ),
+  
+  # k-Nearest Neighbors
+  knn = lrn("classif.kknn",
+    predict_type = "prob"
+  ),
+  
+  # Decision Tree
+  rpart = lrn("classif.rpart",
+    predict_type = "prob"
+  ),
+  
+  # Naive Bayes
+  nb = lrn("classif.naive_bayes",
+    predict_type = "prob"
+  ),
+  
+  # Linear Discriminant Analysis
+  lda = lrn("classif.lda",
+    predict_type = "prob"
+  ),
+  
+  # Quadratic Discriminant Analysis
+  qda = lrn("classif.qda",
+    predict_type = "prob"
+  )
+)
+
+# Define parameter spaces for tuning
+search_spaces <- list(
+  # Random Forest parameters
+  rf = ps(
+    num.trees = p_int(lower = 100, upper = 1000),
+    mtry = p_int(lower = 2, upper = 20),
+    min.node.size = p_int(lower = 1, upper = 10)
+  ),
+  
+  # XGBoost parameters
+  xgb = ps(
+    nrounds = p_int(lower = 100, upper = 1000),
+    eta = p_dbl(lower = 0.01, upper = 0.3),
+    max_depth = p_int(lower = 3, upper = 10),
+    subsample = p_dbl(lower = 0.5, upper = 1),
+    colsample_bytree = p_dbl(lower = 0.5, upper = 1)
+  ),
+  
+  # SVM parameters
+  svm = ps(
+    cost = p_dbl(lower = 0.1, upper = 10, logscale = TRUE),
+    gamma = p_dbl(lower = 0.001, upper = 1, logscale = TRUE)
+  ),
+  
+  # Neural Network parameters
+  nnet = ps(
+    size = p_int(lower = 2, upper = 10),
+    decay = p_dbl(lower = 0.0001, upper = 0.1)
+  ),
+  
+  # Elastic Net parameters
+  glmnet = ps(
+    alpha = p_dbl(lower = 0, upper = 1),
+    lambda = p_dbl(lower = 0.001, upper = 1, logscale = TRUE)
+  ),
+  
+  # k-NN parameters
+  knn = ps(
+    k = p_int(lower = 1, upper = 30)
+  ),
+  
+  # Decision Tree parameters
+  rpart = ps(
+    cp = p_dbl(lower = 0.001, upper = 0.1),
+    minsplit = p_int(lower = 5, upper = 50)
+  ),
+  
+  # Naive Bayes parameters
+  nb = ps(
+    laplace = p_dbl(lower = 0, upper = 10)
+  ),
+  
+  # LDA parameters
+  lda = ps(
+    method = p_fct(levels = c("moment", "mle", "mve", "t"))
+  ),
+  
+  # QDA parameters
+  qda = ps(
+    method = p_fct(levels = c("moment", "mle", "t"))
+  )
+)
+
+# Set up cross-validation
+cv5 = rsmp("cv", folds = 5)
+
+# Initialize results and importance storage
+results <- list()
+importance_list <- list()
+
+# Perform tuning and calculate variable importance for each algorithm
+for (name in names(learners)) {
+  # Create AutoTuner
+  at <- AutoTuner$new(
+    learner = learners[[name]],
+    resampling = cv5,
+    measure = msr("classif.auc"),
+    search_space = search_spaces[[name]],
+    terminator = trm("evals", n_evals = 50),
+    tuner = tnr("random_search")
+  )
+  
+  # Train and evaluate
+  results[[name]] <- resample(task, at, cv5, store_models = TRUE)
+  
+  # Get the best model
+  best_model <- results[[name]]$learners[[1]]
+  
+  # Calculate permutation importance
+  predictor <- Predictor$new(
+    model = best_model,
+    data = ps_df[, -ncol(ps_df)],  # exclude target variable
+    y = ps_df$sal_detection,
+    type = "prob"
+  )
+  
+  importance <- FeatureImp$new(
+    predictor,
+    loss = "ce"
+  )
+  
+  importance_list[[name]] <- importance$results
+}
+
+# Compare results
+scores <- sapply(results, function(x) x$aggregate(msr("classif.auc")))
+print(sort(scores, decreasing = TRUE))
+
+# Plot model performance comparison
+boxplot(
+  lapply(results, function(x) x$score(msr("classif.auc"))),
+  main = "Model Performance Comparison",
+  ylab = "AUC",
+  las = 2
+)
+
+# Plot variable importance for each algorithm
+for (name in names(importance_list)) {
+  imp_data <- importance_list[[name]]
+  
+  p <- ggplot(imp_data[order(-imp_data$importance)[1:20], ], 
+              aes(x = reorder(feature, importance), y = importance)) +
+    geom_bar(stat = "identity") +
+    coord_flip() +
+    theme_minimal() +
+    labs(
+      title = paste("Top 20 Important Features -", name),
+      x = "Features",
+      y = "Importance Score"
+    )
+  
+  print(p)
+}
+
+# Create a combined importance plot (average across all models)
+combined_importance <- do.call(rbind, lapply(names(importance_list), function(name) {
+  imp_data <- importance_list[[name]]
+  imp_data$model <- name
+  return(imp_data)
+}))
+
+avg_importance <- aggregate(importance ~ feature, data = combined_importance, FUN = mean)
+
+ggplot(avg_importance[order(-avg_importance$importance)[1:20], ],
+       aes(x = reorder(feature, importance), y = importance)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "Top 20 Important Features (Average across all models)",
+    x = "Features",
+    y = "Average Importance Score"
+  )
+
+
