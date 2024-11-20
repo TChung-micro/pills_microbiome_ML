@@ -6,7 +6,7 @@ library(paradox)
 library(mlr3viz)
 library(phyloseq)
 library(ggplot2)
-library(iml) # for permutation importance
+library(DALEX) # for variable importance
 
 # Convert phyloseq object to data frame for ML
 ps_df <- data.frame(
@@ -165,20 +165,25 @@ for (name in names(learners)) {
   # Get the best model
   best_model <- results[[name]]$learners[[1]]
   
-  # Calculate permutation importance
-  predictor <- Predictor$new(
+  # Calculate variable importance using DALEX
+  explainer <- explain(
     model = best_model,
     data = ps_df[, -ncol(ps_df)],  # exclude target variable
     y = ps_df$sal_detection,
-    type = "prob"
+    label = name
   )
   
-  importance <- FeatureImp$new(
-    predictor,
-    loss = "ce"
+  # Calculate permutation-based feature importance
+  vi <- model_parts(
+    explainer,
+    loss_function = loss_root_mean_square,
+    type = "difference"
   )
   
-  importance_list[[name]] <- importance$results
+  importance_list[[name]] <- data.frame(
+    feature = vi$variable,
+    importance = vi$dropout_loss
+  )
 }
 
 # Compare results
@@ -230,5 +235,6 @@ ggplot(avg_importance[order(-avg_importance$importance)[1:20], ],
     x = "Features",
     y = "Average Importance Score"
   )
+
 
 
